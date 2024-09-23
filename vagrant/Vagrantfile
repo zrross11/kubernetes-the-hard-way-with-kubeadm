@@ -29,7 +29,7 @@ RESOURCES = {
     2 => {
       # All additional masters get this
       "ram" => [ram_selector * 128, 2048].min(),
-      "cpu" => CPU_CORES > 8 ? 2 : 1,
+      "cpu" => CPU_CORES > 8 ? 2 : 2,
     },
   },
   "worker" => {
