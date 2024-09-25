@@ -1,0 +1,213 @@
+# playbook.yml
+---
+- name: Install Docker, kubernetes on nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install necessary packages
+      apt:
+        name: "{{ item }}"
+        state: present
+        force: yes
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+        - socat
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Add Docker's official GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable
+        state: present
+
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+        state: present
+        force: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        
+    - name: Ensure Docker is running and enabled
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Download cri-dockerd binary
+      get_url:
+        url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.15/cri-dockerd_0.3.15.3-0.ubuntu-jammy_amd64.deb
+        dest: /tmp/cri-dockerd.deb
+
+    - name: Install cri-dockerd package
+      apt:
+        deb: /tmp/cri-dockerd.deb
+
+    - name: Ensure cri-dockerd is enabled and running
+      systemd:
+        name: cri-docker
+        state: started
+        enabled: yes
+
+    - name: Add vagrant user to docker group
+      user:
+        name: vagrant
+        group: docker
+
+    - name: Add Kubernetes apt-key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+        force: true
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+        state: present
+        update_cache: yes
+
+    - name: Install Kubernetes binaries
+      apt: 
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - kubeadm 
+          - kubectl
+          - kubelet
+
+- name: Install and configure HAProxy on load balancer
+  hosts: loadbalancer
+  become: yes
+  tasks:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: present
+        force: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Configure HAProxy
+      template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+      notify:
+        - Restart HAProxy
+
+    - name: Ensure HAProxy is running and enabled
+      service:
+        name: haproxy
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Restart HAProxy
+      service:
+        name: haproxy
+        state: restarted
+
+- name: Initialize Kubernetes cluster
+  hosts: controlplane01
+  become: yes
+  tasks:
+    - name: Initialize the Kubernetes cluster with kubeadm
+      command: >
+        kubeadm init --pod-network-cidr=10.96.0.0/24 --control-plane-endpoint={{ hostvars['loadbalancer']['ansible_host'] }}:6443 
+        --apiserver-advertise-address={{ hostvars['controlplane01']['ansible_host'] }} --cri-socket="unix:///run/cri-dockerd.sock" --kubernetes-version=v1.28.11 --upload-certs
+      register: kubeadm_init_output
+      ignore_errors: yes  # To handle the case if kubeadm init is already run
+
+    - name: Extract the join command with certificate key
+      set_fact:
+        certificate_key: "{{ kubeadm_init_output.stdout | regex_findall('--certificate-key ([a-z0-9]+)') | first }}"
+      ignore_errors: yes  # To handle the case if kubeadm init is already run
+
+
+    - name: Debug the certificate key
+      debug:
+        var: certificate_key
+
+    - name: Create .kube directory
+      file:
+        path: /home/vagrant/.kube
+        state: directory
+        owner: vagrant
+        group: docker
+      become: yes
+      become_user: vagrant
+
+    - name: Copy kubeconfig file
+      command: >
+        cp /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+      become: yes
+      become_user: root
+
+    - name: Set permissions on the kubeconfig file
+      file:
+        path: /home/vagrant/.kube/config
+        owner: vagrant
+        group: vagrant
+      become: yes
+
+    - name: Install Calico CNI plugin
+      command: >
+        kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      become: yes
+      become_user: vagrant
+
+    - name: Get the join command
+      command: kubeadm token create --print-join-command
+      register: join_command
+
+- name: Join additional control plane node2
+  hosts: controlplane02
+  become: yes
+  tasks:
+    - name: Join the control plane node
+      command: >
+        {{ hostvars['controlplane01'].join_command.stdout }} --control-plane --cri-socket="unix:///run/cri-dockerd.sock" --certificate-key={{ hostvars['controlplane01'].certificate_key }}
+      ignore_errors: yes
+
+    - name: Create .kube directory
+      file:
+        path: /home/vagrant/.kube
+        state: directory
+        owner: vagrant
+        group: docker
+      become: yes
+      become_user: vagrant
+
+    - name: Copy kubeconfig file
+      command: >
+        cp /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+      become: yes
+      become_user: root
+
+    - name: Set permissions on the kubeconfig file
+      file:
+        path: /home/vagrant/.kube/config
+        owner: vagrant
+        group: vagrant
+      become: yes
+
+- name: Join worker nodes to the cluster
+  hosts: node01, node02
+  become: yes
+  tasks:
+    - name: Join the worker nodes
+      command: >
+        {{ hostvars['controlplane01'].join_command.stdout }} --cri-socket="unix:///run/cri-dockerd.sock"
+      ignore_errors: yes

@@ -1,0 +1,12 @@
+frontend kubernetes
+    bind 192.168.56.30:6443
+    option tcplog
+    mode tcp
+    default_backend kubernetes-controlplane-nodes
+
+backend kubernetes-controlplane-nodes
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server controlplane01 192.168.56.11:6443 check fall 3 rise 2
+    server controlplane02 192.168.56.12:6443 check fall 3 rise 2
